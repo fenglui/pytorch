@@ -9,10 +9,8 @@ import numpy as _np
 import pytest
 
 import torch._dynamo.config as config
-
 import torch._numpy as tnp
 from torch._numpy.testing import assert_equal
-
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -24,12 +22,8 @@ from torch.testing._internal.common_utils import (
 
 @contextmanager
 def control_stream(use_numpy=False):
-    oldstate = config.use_numpy_random_stream
-    config.use_numpy_random_stream = use_numpy
-    try:
+    with config.patch(use_numpy_random_stream=use_numpy):
         yield
-    finally:
-        config.use_numpy_random_stream = oldstate
 
 
 @instantiate_parametrized_tests

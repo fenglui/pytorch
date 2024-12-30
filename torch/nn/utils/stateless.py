@@ -1,11 +1,12 @@
+# mypy: allow-untyped-defs
 import contextlib
-import warnings
-from collections import defaultdict
-from typing import Any, Dict, Iterator, Optional, Set, Tuple, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing_extensions import deprecated
 
 import torch
 from torch import Tensor
 from torch.nn.utils._named_member_accessor import NamedMemberAccessor
+
 
 __all__ = ["functional_call"]
 
@@ -45,8 +46,10 @@ def _untie_named_tensors_map(
     all_named_tensors.update(module.named_buffers(remove_duplicate=False))
 
     # A map of {tensor: set(all_tied_names)} for all tensor names in the module.
-    tensor_to_tied_names_map: Dict[Tensor, Set[str]] = defaultdict(set)
+    tensor_to_tied_names_map: Dict[Tensor, Set[str]] = {}
     for name, tensor in all_named_tensors.items():
+        if tensor not in tensor_to_tied_names_map:
+            tensor_to_tied_names_map[tensor] = set()
         tensor_to_tied_names_map[tensor].add(name)
 
     # A map of {tied_name: set(all_tied_names)} for all tensor names in the module.
@@ -59,7 +62,13 @@ def _untie_named_tensors_map(
 
     # Make sure the user didn't pass multiple values for the same tied tensor.
     given_names = set(parameters_and_buffers.keys())
-    given_names_for_tied_tensors = given_names.intersection(tied_names_map.keys())
+    # same as given_names.intersection(tied_names_map.keys()) but dynamo can't
+    # handle that
+    given_names_for_tied_tensors: set[str] = set()
+    for name in given_names:
+        if name in tied_names_map:
+            given_names_for_tied_tensors.add(name)
+
     for given_name in given_names_for_tied_tensors:
         tied_names = tied_names_map[given_name]
         if (
@@ -90,10 +99,13 @@ def _untie_named_tensors_map(
 def _reparametrize_module(
     module: "torch.nn.Module",
     parameters_and_buffers: Dict[str, Tensor],
-    *,
     tie_weights: bool = False,
     strict: bool = False,
-) -> Iterator[None]:
+    stack_weights: bool = False,
+):
+    parameters_and_buffers = parameters_and_buffers
+    stack_weights = stack_weights
+
     if tie_weights:
         untied_parameters_and_buffers = _untie_named_tensors_map(
             module, parameters_and_buffers
@@ -127,6 +139,11 @@ def _reparametrize_module(
         )
         yield
     finally:
+        if stack_weights:
+            # When stacking is enabled, we will restore the weights in LIFO order.
+            orig_parameters_and_buffers = dict(
+                reversed(orig_parameters_and_buffers.items())
+            )
         new_parameters_and_buffers, _ = accessor.swap_tensors_dict(
             orig_parameters_and_buffers, allow_missing=True
         )
@@ -142,17 +159,22 @@ def _reparametrize_module(
         )
 
 
+@deprecated(
+    "`torch.nn.utils.stateless.functional_call` is deprecated as of PyTorch 2.0 "
+    "and will be removed in a future version of PyTorch. "
+    "Please use `torch.func.functional_call` instead which is a drop-in replacement.",
+    category=FutureWarning,
+)
 def functional_call(
     module: "torch.nn.Module",
     parameters_and_buffers: Dict[str, Tensor],
-    args: Union[Any, Tuple],
+    args: Optional[Union[Any, Tuple]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
     *,
     tie_weights: bool = True,
     strict: bool = False,
 ):
-    r"""Performs a functional call on the module by replacing the module parameters
-    and buffers with the provided ones.
+    r"""Perform a functional call on the module by replacing the module parameters and buffers with the provided ones.
 
     .. warning::
 
@@ -191,7 +213,7 @@ def functional_call(
             >>> mod(torch.zeros(()))  # tensor(2.)
             >>> functional_call(mod, a, torch.zeros(()))  # tensor(0.) since it will change self.foo_tied too
             >>> functional_call(mod, a, torch.zeros(()), tie_weights=False)  # tensor(1.)--self.foo_tied is not updated
-            >>> new_a = {'foo', torch.zeros(()), 'foo_tied': torch.zeros(())}
+            >>> new_a = {'foo': torch.zeros(()), 'foo_tied': torch.zeros(())}
             >>> functional_call(mod, new_a, torch.zeros()) # tensor(0.)
 
     Args:
@@ -211,12 +233,6 @@ def functional_call(
     Returns:
         Any: the result of calling ``module``.
     """
-    warnings.warn(
-        "This API is deprecated as of PyTorch 2.0 and will be removed in a future "
-        "version of PyTorch. Please use torch.func.functional_call instead "
-        "which is a drop-in replacement for this API."
-    )
-
     return _functional_call(
         module,
         parameters_and_buffers,
@@ -230,7 +246,7 @@ def functional_call(
 def _functional_call(
     module: "torch.nn.Module",
     parameters_and_buffers: Dict[str, Tensor],
-    args: Union[Any, Tuple],
+    args: Optional[Union[Any, Tuple]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
     *,
     tie_weights: bool = True,
@@ -256,7 +272,9 @@ def _functional_call(
         )
     if kwargs is None:
         kwargs = {}
-    if not isinstance(args, tuple):
+    if args is None:
+        args = ()
+    elif not isinstance(args, tuple):
         args = (args,)
     with _reparametrize_module(
         module, parameters_and_buffers, tie_weights=tie_weights, strict=strict
